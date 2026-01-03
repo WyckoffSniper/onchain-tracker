@@ -1,266 +1,410 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import React, { useMemo, useState } from "react";
+import ReactFlow, { Background, Controls, MiniMap, type Node, type Edge } from "reactflow";
+import "reactflow/dist/style.css";
 
-type ApiOk = {
-  ok: true;
+type Direction = "downstream" | "upstream" | "both";
+
+type ApiNode = {
+  id: string;
+  label: string;
+  kind: "wallet" | "contract" | "unknown";
+};
+
+type ApiEdge = {
+  id: string;
   source: string;
+  target: string;
+  label: string;
+  txHash: string;
+  timeStamp: number;
+};
+
+type StartTransfer = {
+  timeStamp: string;
+  hash: string;
+  from: string;
+  to: string;
+  tokenSymbol: string;
+  tokenName: string;
+  tokenDecimal: string;
+  value: string;
+  direction: "in" | "out";
+  amountFormatted: string;
+};
+
+type TraceResponse = {
+  ok: boolean;
+  error?: string;
+  wallet: string;
   token: string;
-  count: number;
-  transfers: Array<{
-    hash: string;
-    from: string;
-    to: string;
-    timeStamp?: string; // etherscan string unix seconds
-    tokenSymbol?: string;
-    tokenName?: string;
-    tokenDecimal?: string;
-    value?: string; // raw integer string
-  }>;
+  direction: Direction;
+  maxHops: number;
+  perAddressLimit: number;
+  summary: { nodes: number; edges: number; startTransfers: number };
+  graph: { nodes: ApiNode[]; edges: ApiEdge[] };
+  startTransfers: StartTransfer[];
 };
 
-type ApiErr = {
-  ok: false;
-  error: string;
-  etherscan?: {
-    status: string;
-    message: string;
-    result: any;
-  };
-};
-
-type ApiResponse = ApiOk | ApiErr;
+function isEthAddress(x: string) {
+  return /^0x[a-fA-F0-9]{40}$/.test(x.trim());
+}
 
 function shortAddr(a: string) {
-  if (!a || a.length < 10) return a;
-  return `${a.slice(0, 6)}…${a.slice(-4)}`;
+  const s = a.trim();
+  if (!isEthAddress(s)) return s;
+  return `${s.slice(0, 6)}…${s.slice(-4)}`;
 }
 
-function formatTime(ts?: string) {
-  if (!ts) return "";
-  const n = Number(ts);
-  if (!Number.isFinite(n)) return "";
-  const d = new Date(n * 1000);
-  return d.toLocaleString();
-}
-
-// Best-effort formatting; avoids BigInt issues for huge values
-function formatTokenAmount(raw?: string, decimalsStr?: string) {
-  if (!raw) return "";
-  const decimals = Number(decimalsStr ?? "0");
-  if (!Number.isFinite(decimals) || decimals <= 0) return raw;
-
-  // If raw is enormous, do a simple string decimal shift without floating point
-  const s = raw.replace(/^0+/, "") || "0";
-  if (decimals === 0) return s;
-
-  const pad = decimals - s.length + 1;
-  const whole = pad > 0 ? "0" : s.slice(0, s.length - decimals);
-  const frac = (pad > 0 ? "0".repeat(pad) + s : s).slice(-decimals);
-
-  // trim trailing zeros
-  const fracTrim = frac.replace(/0+$/, "");
-  return fracTrim ? `${whole}.${fracTrim}` : whole;
+function fmtTime(ts: string) {
+  const n = Number(ts) * 1000;
+  if (!n) return "-";
+  return new Date(n).toLocaleString();
 }
 
 export default function Home() {
-  const [source, setSource] = useState("");
+  const [wallet, setWallet] = useState("");
   const [token, setToken] = useState("");
+  const [direction, setDirection] = useState<Direction>("downstream");
+  const [maxHops, setMaxHops] = useState(2);
+  const [perAddressLimit, setPerAddressLimit] = useState(50);
+
+  const [tab, setTab] = useState<"graph" | "table">("graph");
+
   const [loading, setLoading] = useState(false);
-  const [data, setData] = useState<ApiResponse | null>(null);
+  const [data, setData] = useState<TraceResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
-  const ok = data && "ok" in data && data.ok;
+  const flowNodes: Node[] = useMemo(() => {
+    if (!data?.graph?.nodes) return [];
+    // Simple layout: ReactFlow will auto-place at (0,0) if none; we give a radial-ish scatter
+    const nodes = data.graph.nodes;
+    const center = nodes[0]?.id;
+    const radius = 220;
 
-  const rows = useMemo(() => {
-    if (!ok) return [];
-    return data.transfers ?? [];
-  }, [ok, data]);
+    return nodes.map((n, idx) => {
+      const angle = (idx / Math.max(1, nodes.length)) * Math.PI * 2;
+      const isCenter = n.id === center;
 
-  async function runTrace() {
-    setLoading(true);
+      // Minimal styling, modern look
+      const baseStyle: React.CSSProperties = {
+        borderRadius: 14,
+        padding: 10,
+        border: "1px solid rgba(255,255,255,0.12)",
+        background: "rgba(255,255,255,0.06)",
+        color: "white",
+        fontSize: 12,
+        lineHeight: 1.2,
+        width: 200,
+        whiteSpace: "pre-line",
+        boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+      };
+
+      const kindTag =
+        n.kind === "contract" ? "Contract" : n.kind === "wallet" ? "Wallet" : "Unknown";
+
+      const label = `${n.label}\n${kindTag}`;
+
+      return {
+        id: n.id,
+        position: isCenter
+          ? { x: 0, y: 0 }
+          : { x: Math.cos(angle) * radius, y: Math.sin(angle) * radius },
+        data: { label },
+        style: baseStyle,
+      };
+    });
+  }, [data]);
+
+  const flowEdges: Edge[] = useMemo(() => {
+    if (!data?.graph?.edges) return [];
+    return data.graph.edges.slice(0, 250).map((e) => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      label: e.label,
+      animated: false,
+      style: { strokeWidth: 1.2, stroke: "rgba(255,255,255,0.35)" },
+      labelStyle: { fill: "rgba(255,255,255,0.85)", fontSize: 11 },
+    }));
+  }, [data]);
+
+  async function run() {
+    setError(null);
     setData(null);
 
+    if (!isEthAddress(wallet)) {
+      setError("Wallet must be a valid 0x address.");
+      return;
+    }
+    if (!isEthAddress(token)) {
+      setError("Token must be a valid token contract 0x address.");
+      return;
+    }
+
+    setLoading(true);
     try {
       const res = await fetch("/api/trace", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          source: source.trim(),
+          wallet: wallet.trim(),
           token: token.trim(),
+          direction,
+          maxHops,
+          perAddressLimit,
         }),
       });
 
-      // read as text first so we can show a helpful error if server returns non-JSON
-      const text = await res.text();
-      let json: any = null;
-      try {
-        json = text ? JSON.parse(text) : null;
-      } catch {
-        setData({
-          ok: false,
-          error: `Server did not return JSON (status ${res.status}).`,
-        });
-        return;
-      }
-
-      if (!res.ok || !json?.ok) {
-        setData({
-          ok: false,
-          error: json?.error || `Request failed (status ${res.status}).`,
-          etherscan: json?.etherscan,
-        });
-        return;
-      }
-
-      setData(json as ApiOk);
+      const json = (await res.json()) as TraceResponse;
+      if (!res.ok || !json.ok) throw new Error(json.error || "Request failed");
+      setData(json);
     } catch (e: any) {
-      setData({ ok: false, error: e?.message || "Network error" });
+      setError(e?.message || "Unknown error");
     } finally {
       setLoading(false);
     }
   }
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-white flex items-center justify-center p-6">
-      <div className="w-full max-w-4xl rounded-2xl border border-white/10 bg-white/5 p-6">
-        <div className="flex flex-col gap-2">
-          <h1 className="text-2xl font-bold">ERC-20 Transfer Path Tracker</h1>
-          <p className="text-sm text-zinc-300">
-            Paste a wallet + token <span className="text-white/80">(contract)</span> to view recent ERC-20 transfers.
-          </p>
-        </div>
+    <main className="min-h-screen bg-zinc-950 text-white">
+      <div className="mx-auto max-w-6xl px-5 py-10">
+        <div className="flex flex-col gap-6">
+          {/* Header */}
+          <div className="flex flex-col gap-2">
+            <h1 className="text-3xl font-semibold tracking-tight">Token Path Explorer</h1>
+            <p className="text-zinc-300">
+              Trace ERC-20 flows across connected wallets/contracts. Use upstream to find where tokens came from,
+              downstream to see dispersal/sell paths.
+            </p>
+          </div>
 
-        <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-3">
-          <input
-            className="w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none"
-            placeholder="Source wallet address (0x...)"
-            value={source}
-            onChange={(e) => setSource(e.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-          <input
-            className="w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none"
-            placeholder="Token contract address (0x...)"
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            autoCapitalize="none"
-            autoCorrect="off"
-            spellCheck={false}
-          />
-        </div>
-
-        <button
-          onClick={runTrace}
-          disabled={loading}
-          className="mt-4 w-full rounded-xl bg-white text-black font-semibold py-3 disabled:opacity-50"
-        >
-          {loading ? "Tracing..." : "Track Transfers"}
-        </button>
-
-        {/* Errors */}
-        {data && !data.ok && (
-          <div className="mt-4 text-sm border border-red-400/30 rounded-xl bg-red-500/10 p-4 text-red-200">
-            <div className="font-semibold mb-1">Error</div>
-            <div>{data.error}</div>
-
-            {data.etherscan && (
-              <div className="mt-3 text-xs text-red-100/90">
-                <div>
-                  <span className="text-red-100/70">Etherscan status:</span>{" "}
-                  {data.etherscan.status} • {data.etherscan.message}
-                </div>
-                {typeof data.etherscan.result === "string" && (
-                  <div className="mt-1">
-                    <span className="text-red-100/70">Details:</span> {data.etherscan.result}
-                  </div>
-                )}
+          {/* Controls */}
+          <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-12">
+              <div className="md:col-span-6">
+                <label className="text-sm text-zinc-300">Wallet (starting point)</label>
+                <input
+                  className="mt-2 w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none focus:border-white/20"
+                  placeholder="0x..."
+                  value={wallet}
+                  onChange={(e) => setWallet(e.target.value)}
+                />
+                <p className="mt-2 text-xs text-zinc-400">
+                  This is your “Wallet A” starting node.
+                </p>
               </div>
-            )}
-          </div>
-        )}
 
-        {/* Success summary */}
-        {ok && (
-          <div className="mt-4 flex flex-wrap items-center gap-2 text-sm text-zinc-200">
-            <span className="px-3 py-1 rounded-full bg-black/30 border border-white/10">
-              Wallet: <span className="text-white">{shortAddr(data.source)}</span>
-            </span>
-            <span className="px-3 py-1 rounded-full bg-black/30 border border-white/10">
-              Token: <span className="text-white">{shortAddr(data.token)}</span>
-            </span>
-            <span className="px-3 py-1 rounded-full bg-black/30 border border-white/10">
-              Transfers: <span className="text-white">{data.count}</span>
-            </span>
-          </div>
-        )}
+              <div className="md:col-span-6">
+                <label className="text-sm text-zinc-300">Token Contract</label>
+                <input
+                  className="mt-2 w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none focus:border-white/20"
+                  placeholder="0x..."
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                />
+                <p className="mt-2 text-xs text-zinc-400">
+                  Must be the ERC-20 contract address (not a wallet).
+                </p>
+              </div>
 
-        {/* Results table */}
-        {ok && (
-          <div className="mt-4 overflow-auto rounded-xl border border-white/10 bg-black/20">
-            <table className="min-w-full text-left text-xs">
-              <thead className="text-zinc-300 bg-black/30">
-                <tr>
-                  <th className="px-3 py-2 whitespace-nowrap">Time</th>
-                  <th className="px-3 py-2 whitespace-nowrap">From</th>
-                  <th className="px-3 py-2 whitespace-nowrap">To</th>
-                  <th className="px-3 py-2 whitespace-nowrap">Token</th>
-                  <th className="px-3 py-2 whitespace-nowrap">Amount</th>
-                  <th className="px-3 py-2 whitespace-nowrap">Hash</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-white/10">
-                {rows.slice(0, 50).map((tx, i) => {
-                  const amount = formatTokenAmount(tx.value, tx.tokenDecimal);
-                  const symbol = tx.tokenSymbol || "";
-                  return (
-                    <tr key={`${tx.hash}-${i}`} className="hover:bg-white/5">
-                      <td className="px-3 py-2 whitespace-nowrap text-zinc-300">
-                        {formatTime(tx.timeStamp)}
-                      </td>
-                      <td className="px-3 py-2 font-mono whitespace-nowrap">
-                        {shortAddr(tx.from)}
-                      </td>
-                      <td className="px-3 py-2 font-mono whitespace-nowrap">
-                        {shortAddr(tx.to)}
-                      </td>
-                      <td className="px-3 py-2 whitespace-nowrap">
-                        {symbol || tx.tokenName || "-"}
-                      </td>
-                      <td className="px-3 py-2 whitespace-nowrap">
-                        {amount ? `${amount} ${symbol}`.trim() : "-"}
-                      </td>
-                      <td className="px-3 py-2 font-mono whitespace-nowrap">
-                        <a
-                          className="underline underline-offset-2 text-zinc-200 hover:text-white"
-                          href={`https://etherscan.io/tx/${tx.hash}`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          {tx.hash ? shortAddr(tx.hash) : "-"}
-                        </a>
-                      </td>
+              <div className="md:col-span-4">
+                <label className="text-sm text-zinc-300">Direction</label>
+                <select
+                  className="mt-2 w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none focus:border-white/20"
+                  value={direction}
+                  onChange={(e) => setDirection(e.target.value as Direction)}
+                >
+                  <option value="downstream">Downstream (where it went)</option>
+                  <option value="upstream">Upstream (where it came from)</option>
+                  <option value="both">Both</option>
+                </select>
+              </div>
+
+              <div className="md:col-span-4">
+                <label className="text-sm text-zinc-300">Max Hops (depth)</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={4}
+                  className="mt-2 w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none focus:border-white/20"
+                  value={maxHops}
+                  onChange={(e) => setMaxHops(Number(e.target.value))}
+                />
+                <p className="mt-2 text-xs text-zinc-400">
+                  Higher hops = more addresses = slower/more API usage.
+                </p>
+              </div>
+
+              <div className="md:col-span-4">
+                <label className="text-sm text-zinc-300">Per Address Limit</label>
+                <input
+                  type="number"
+                  min={10}
+                  max={200}
+                  className="mt-2 w-full rounded-xl bg-zinc-900 border border-white/10 px-4 py-3 outline-none focus:border-white/20"
+                  value={perAddressLimit}
+                  onChange={(e) => setPerAddressLimit(Number(e.target.value))}
+                />
+                <p className="mt-2 text-xs text-zinc-400">
+                  How many recent transfers to pull per node.
+                </p>
+              </div>
+
+              <div className="md:col-span-12 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <button
+                  onClick={run}
+                  disabled={loading}
+                  className="rounded-xl bg-white text-black font-semibold px-5 py-3 disabled:opacity-50"
+                >
+                  {loading ? "Tracing…" : "Trace Path"}
+                </button>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setTab("graph")}
+                    className={`rounded-xl px-4 py-2 text-sm border ${
+                      tab === "graph"
+                        ? "bg-white text-black border-white"
+                        : "bg-transparent text-white border-white/15"
+                    }`}
+                  >
+                    Graph
+                  </button>
+                  <button
+                    onClick={() => setTab("table")}
+                    className={`rounded-xl px-4 py-2 text-sm border ${
+                      tab === "table"
+                        ? "bg-white text-black border-white"
+                        : "bg-transparent text-white border-white/15"
+                    }`}
+                  >
+                    Transactions
+                  </button>
+                </div>
+              </div>
+
+              {error && (
+                <div className="md:col-span-12 rounded-xl border border-red-400/30 bg-red-500/10 p-4 text-red-200">
+                  {error}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Summary */}
+          {data && (
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+                <div className="text-xs text-zinc-400">Nodes</div>
+                <div className="mt-1 text-2xl font-semibold">{data.summary.nodes}</div>
+                <div className="mt-2 text-sm text-zinc-300">
+                  Wallets/contracts detected in path.
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+                <div className="text-xs text-zinc-400">Edges</div>
+                <div className="mt-1 text-2xl font-semibold">{data.summary.edges}</div>
+                <div className="mt-2 text-sm text-zinc-300">
+                  Transfer links between nodes.
+                </div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+                <div className="text-xs text-zinc-400">Start Wallet Transfers</div>
+                <div className="mt-1 text-2xl font-semibold">{data.summary.startTransfers}</div>
+                <div className="mt-2 text-sm text-zinc-300">
+                  Recent transfers touching Wallet A.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Content */}
+          {data && tab === "graph" && (
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-3">
+              <div className="px-3 pt-3 pb-2 flex items-center justify-between">
+                <div>
+                  <div className="text-sm text-zinc-300">Graph View</div>
+                  <div className="text-xs text-zinc-500">
+                    Wallet A: <span className="text-zinc-300">{shortAddr(data.wallet)}</span> · Token:{" "}
+                    <span className="text-zinc-300">{shortAddr(data.token)}</span>
+                  </div>
+                </div>
+                <div className="text-xs text-zinc-500">
+                  Tip: zoom/drag, click nodes, use controls.
+                </div>
+              </div>
+
+              <div style={{ width: "100%", height: 560 }}>
+                <ReactFlow nodes={flowNodes} edges={flowEdges} fitView>
+                  <Background />
+                  <MiniMap />
+                  <Controls />
+                </ReactFlow>
+              </div>
+            </div>
+          )}
+
+          {data && tab === "table" && (
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-5">
+              <div className="flex flex-col gap-1 pb-4">
+                <div className="text-sm text-zinc-300">Transactions touching Wallet A</div>
+                <div className="text-xs text-zinc-500">
+                  This table shows transfers directly in/out of your starting wallet (fast + useful for context).
+                </div>
+              </div>
+
+              <div className="overflow-auto rounded-xl border border-white/10">
+                <table className="min-w-full text-sm">
+                  <thead className="bg-black/30 text-zinc-300">
+                    <tr>
+                      <th className="text-left px-4 py-3 font-medium">Time</th>
+                      <th className="text-left px-4 py-3 font-medium">Type</th>
+                      <th className="text-left px-4 py-3 font-medium">From</th>
+                      <th className="text-left px-4 py-3 font-medium">To</th>
+                      <th className="text-left px-4 py-3 font-medium">Amount</th>
+                      <th className="text-left px-4 py-3 font-medium">Tx</th>
                     </tr>
-                  );
-                })}
+                  </thead>
+                  <tbody>
+                    {data.startTransfers.length === 0 ? (
+                      <tr>
+                        <td className="px-4 py-4 text-zinc-400" colSpan={6}>
+                          No transfers found for that wallet + token (or API returned none).
+                        </td>
+                      </tr>
+                    ) : (
+                      data.startTransfers.map((t) => (
+                        <tr key={t.hash} className="border-t border-white/10 text-zinc-100">
+                          <td className="px-4 py-3 text-zinc-300">{fmtTime(t.timeStamp)}</td>
+                          <td className="px-4 py-3">
+                            <span
+                              className={`inline-flex items-center rounded-full px-2 py-1 text-xs border ${
+                                t.direction === "in"
+                                  ? "border-emerald-400/30 text-emerald-200 bg-emerald-500/10"
+                                  : "border-amber-400/30 text-amber-200 bg-amber-500/10"
+                              }`}
+                            >
+                              {t.direction === "in" ? "Received" : "Sent"}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 font-mono text-xs text-zinc-300">{shortAddr(t.from)}</td>
+                          <td className="px-4 py-3 font-mono text-xs text-zinc-300">{shortAddr(t.to)}</td>
+                          <td className="px-4 py-3">{t.amountFormatted}</td>
+                          <td className="px-4 py-3 font-mono text-xs text-zinc-400">{shortAddr(t.hash)}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
 
-                {rows.length === 0 && (
-                  <tr>
-                    <td className="px-3 py-6 text-zinc-300" colSpan={6}>
-                      No transfers found for that wallet + token. (Or Etherscan returned none.)
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        )}
-
-        {/* Helpful hint */}
-        <div className="mt-4 text-xs text-zinc-400">
-          Tip: the second field must be the <span className="text-zinc-200">token contract address</span> (not a wallet).
-          Make sure you also set <span className="text-zinc-200">ETHERSCAN_API_KEY</span> in Vercel Environment Variables.
+              <div className="pt-4 text-xs text-zinc-500">
+                Next upgrade: click a node/tx to expand the graph around it (wallet clustering).
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </main>
